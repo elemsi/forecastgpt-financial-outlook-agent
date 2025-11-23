@@ -1,0 +1,62 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.sqlite3
+
+# --- Virtual Environment ---
+.venv/
+env/
+venv/
+
+# --- Environment Files ---
+.env
+.env.*
+!env.example
+
+# --- Cache & Temporary Files ---
+cache/
+*.log
+*.tmp
+*.temp
+*.swp
+*.DS_Store
+
+# --- Ollama ---
+ollama/
+ollama_models/
+
+# --- PDFs & Data Files ---
+data/cache/
+*.pdf
+
+# --- Project Explanation (Ignore) ---
+Project_Explanation_PDF/
+all_links.txt
+
+# --- Jupyter Notebook ---
+.ipynb_checkpoints/
+
+# --- MySQL Dumps ---
+*.sql
+*.db
+
+# --- OS Files ---
+Thumbs.db
+desktop.ini
+
+# --- VS Code ---
+.vscode/
+.history/
+
+# --- Build ---
+dist/
+build/
+*.egg-info
+
+# --- Screenshots ---
+screenshots/source/
+screenshots/raw/
