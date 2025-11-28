@@ -2,10 +2,10 @@ from typing import Dict, Any, List
 import json
 import re
 
-# ✅ Prefer new package if available, else fallback
+# Prefer langchain_ollama if available, else fall back to community ChatOllama
 try:
     from langchain_ollama import ChatOllama
-except Exception:
+except Exception:  # pragma: no cover - safe runtime fallback
     from langchain_community.chat_models import ChatOllama
 
 from app.utils.config import settings
@@ -16,18 +16,28 @@ from app.utils.logger import get_logger
 
 log = get_logger("ForecastAgent")
 
+# ---------------------------------------------------------------------------
+# System prompt – keeps role, schema and behaviour very explicit so the model
+# produces strong, concrete outputs instead of "unclear".
+# ---------------------------------------------------------------------------
 
-# ✅ IMPORTANT: keep schema braces normal here (NO formatting will run on this)
 SYSTEM_PROMPT = """
 You are ForecastGPT, a financial forecasting agent for Tata Consultancy Services (TCS).
 
-Rules:
-- Use ONLY provided financial metrics and transcript evidence.
-- If evidence is missing or unclear, say so explicitly in the JSON.
-- Output ONLY valid JSON matching the schema.
-- Do not add any extra keys outside schema.
+Your goal:
+Given structured financial metrics, key transcript snippets and optional market context,
+you must produce a concise, investor-style qualitative outlook for the *next quarter*.
 
-Schema (follow EXACT structure):
+Ground rules (very important):
+- Use ONLY facts that can be reasonably inferred from the provided inputs.
+- If a specific metric is missing, do NOT hallucinate an exact number.
+- Instead, speak in directions and trends: "increasing", "declining", "stable", "volatile", etc.
+- Always fill the JSON schema fields with your best good-faith view.
+- Be specific and differentiated across revenue, profit and margin – avoid saying "unclear" unless there is genuinely no signal.
+
+Output format:
+- You MUST return a single JSON object.
+- The JSON MUST strictly follow this schema and key order:
 
 {
   "company": "TCS",
@@ -44,138 +54,181 @@ Schema (follow EXACT structure):
   "confidence": {
      "level": "low|medium|high",
      "reasons": ["string"]
-  },
-  "sources": {
-     "financial_docs": ["string"],
-     "transcripts": ["string"]
-  },
-  "market_context": {}
+  }
 }
+
+Field guidance:
+- period_analyzed: list of the quarter names or periods you are basing your view on.
+- financial_trends.revenue: direction + 1 short reason (e.g. "increasing, driven by strong BFSI demand").
+- financial_trends.net_profit: direction + key drivers (e.g. "stable despite wage hikes due to cost optimisation").
+- financial_trends.operating_margin: direction + colour on utilisation / pricing / costs.
+- management_themes: 4–8 short bullets summarising what management emphasised.
+- risks: 3–6 concise, real risks (macro, client concentration, pricing pressure, attrition, etc.).
+- opportunities: 3–6 concise upside levers (GenAI deals, cost takeout programmes, large deal pipeline, etc.).
+- qualitative_forecast_next_quarter: 2–4 sentences summarising your expectation for the next quarter.
+- confidence: honest assessment based on depth/clarity of evidence. If transcripts and multiple quarters
+  of data are available, confidence should usually be "medium" or "high".
+
+Do NOT:
+- Add keys outside this schema.
+- Wrap the JSON in markdown or natural language.
+- Leave fields empty; if something is genuinely unknown, say that explicitly in the string.
 """
 
+# ---------------------------------------------------------------------------
+# Helper: robust JSON extraction
+# ---------------------------------------------------------------------------
 
-def _safe_json_extract(text: str) -> Dict[str, Any]:
+def _parse_json_loose(text: str) -> Dict[str, Any]:
     """
-    Robust JSON extraction:
-    - Direct JSON
-    - JSON inside markdown
-    - Extra text around JSON
+    Try to recover a JSON object from an LLM response.
+    Handles:
+    - pure JSON
+    - JSON with leading/trailing text
+    - JSON wrapped in markdown fences
     """
     text = text.strip()
 
-    # 1) direct parse
+    # Strip ```json fences if present
+    fence_match = re.search(r"```(?:json)?(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        text = fence_match.group(1).strip()
+
+    # Direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
 
-    # 2) find first {...} block
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        json_str = match.group(0)
+    # Fallback: first {...} block
+    brace_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if brace_match:
+        json_str = brace_match.group(0)
         return json.loads(json_str)
 
-    raise ValueError("No valid JSON found in model output")
+    raise ValueError("Could not find valid JSON in model output")
+
+
+# ---------------------------------------------------------------------------
+# Helper: compress transcript themes so the prompt fits within context window
+# ---------------------------------------------------------------------------
+
+def _compress_themes(themes: Any,
+                     max_snippets_per_topic: int = 2,
+                     max_chars_per_snippet: int = 400) -> Any:
+    """
+    themes is usually a dict[str, list[str]] from QualitativeAnalysisTool.
+    We keep only the first `max_snippets_per_topic` snippets per topic and
+    truncate each snippet to `max_chars_per_snippet` characters to avoid
+    blowing up the LLM context window.
+    """
+    if not isinstance(themes, dict):
+        return themes
+
+    compressed: Dict[str, List[str]] = {}
+    for topic, snippets in themes.items():
+        if not isinstance(snippets, list):
+            continue
+        trimmed: List[str] = []
+        for snip in snippets[:max_snippets_per_topic]:
+            if not isinstance(snip, str):
+                continue
+            trimmed.append(snip[:max_chars_per_snippet])
+        if trimmed:
+            compressed[topic] = trimmed
+    return compressed
+
+
+MAX_PROMPT_CHARS = 10000  # safeguard for very large inputs
 
 
 class ForecastAgent:
-    def __init__(self):
+    def __init__(self) -> None:
+        # We keep the attribute name OPENAI_MODEL for compatibility with your .env
+        model_name = getattr(settings, "OPENAI_MODEL", "llama3.2")
         self.llm = ChatOllama(
-            model=getattr(settings, "OPENAI_MODEL", "llama3.2"),
-            temperature=0.2
+            model=model_name,
+            temperature=0.2,
         )
+        log.info(f"ForecastAgent initialised with model: {model_name}")
 
     def run(self, query: str, financial_pdfs: List[str], transcripts: List[str]) -> Dict[str, Any]:
-        # ✅ 1. Extract financial metrics
+        # 1) Extract hard financial metrics from quarterly PDFs
         fin = extract_financial_metrics(financial_pdfs)
 
-        # ✅ 2. Transcript RAG safely
-        themes = []
+        # 2) Build RAG index over transcripts – but keep failure completely non-fatal
+        themes: Any = []
         try:
             if transcripts:
                 rag = QualitativeAnalysisTool()
                 rag.build_index(transcripts)
-                themes = rag.query_themes([
-                    "revenue growth drivers and headwinds",
-                    "margin outlook and cost pressures",
-                    "deal pipeline and demand commentary",
-                    "AI/GenAI and cloud opportunities",
-                    "key risks mentioned by management"
-                ])
+                raw_themes = rag.query_themes(
+                    [
+                        "revenue growth drivers and headwinds",
+                        "margin outlook and cost pressures",
+                        "deal pipeline and demand commentary",
+                        "AI and GenAI opportunities and use-cases",
+                        "client spend behaviour and macro commentary",
+                        "key risks highlighted by management",
+                    ]
+                )
+                themes = _compress_themes(raw_themes)
             else:
                 themes = ["No transcript provided by user."]
         except Exception as e:
             log.warning(f"Transcript RAG failed: {e}")
-            themes = ["Transcript analysis failed due to indexing error."]
+            themes = ["Transcript analysis failed; proceeding with financials only."]
 
-        # ✅ 3. Market data safe fallback (429 won't break run)
+        # 3) Optional market data – completely best-effort
         try:
             market = fetch_tcs_stock_price()
-        except Exception as e:
+        except Exception as e:  # pragma: no cover
             log.warning(f"Market fetch failed, continuing without it: {e}")
             market = {}
 
-        # ✅ 4. MANUAL user prompt (NO ChatPromptTemplate formatting)
-        user_prompt = f"""
-Task: {query}
+        # 4) Build a single user prompt string (no templating logic that can break)
+        user_parts = [
+            f"Task: {query}",
+            "",
+            "Structured financial metrics extracted from quarterly financial statements (already parsed for you):",
+            json.dumps(fin, indent=2, ensure_ascii=False),
+            "",
+            "Key management commentary snippets from earnings call transcripts, grouped by analytical theme:",
+            json.dumps(themes, indent=2, ensure_ascii=False),
+            "",
+            "Optional market context for the TCS stock (can be empty):",
+            json.dumps(market, indent=2, ensure_ascii=False),
+            "",
+            "Now, using ONLY the information above and following the schema from the system prompt, "
+            "produce the final JSON forecast object.",
+        ]
+        user_prompt = "\n".join(user_parts)
 
-Financial metrics extracted from quarterly documents:
-{fin}
-
-Semantically retrieved transcript evidence:
-{themes}
-
-Optional market context (may be empty):
-{market}
-
-Return ONLY the forecast JSON now.
-"""
+        # Final character-level safeguard
+        if len(user_prompt) > MAX_PROMPT_CHARS:
+            # keep the tail – it will always contain the most recent, structured pieces
+            user_prompt = user_prompt[-MAX_PROMPT_CHARS:]
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ]
 
-        res = self.llm.invoke(messages).content
+        raw = self.llm.invoke(messages).content
 
-        # ✅ 5. Parse strict JSON
+        # 5) Parse / normalise JSON with robust error-handling
         try:
-            parsed = _safe_json_extract(res)
-
-            # Ensure required top-level keys always exist
-            parsed.setdefault("company", "TCS")
-            parsed.setdefault("period_analyzed", [])
-            parsed.setdefault("financial_trends", {
-                "revenue": "unclear",
-                "net_profit": "unclear",
-                "operating_margin": "unclear"
-            })
-            parsed.setdefault("management_themes", [])
-            parsed.setdefault("risks", [])
-            parsed.setdefault("opportunities", [])
-            parsed.setdefault("qualitative_forecast_next_quarter", "")
-            parsed.setdefault("confidence", {
-                "level": "low",
-                "reasons": ["Missing confidence from model"]
-            })
-            parsed.setdefault("sources", {
-                "financial_docs": financial_pdfs,
-                "transcripts": transcripts
-            })
-            parsed.setdefault("market_context", market)
-
-            return parsed
-
+            parsed = _parse_json_loose(raw)
         except Exception as e:
-            log.error(f"Model returned invalid JSON: {e}")
-
+            log.error(f"Model output was not valid JSON: {e}")
+            # Minimal but still useful fallback payload
             return {
                 "company": "TCS",
                 "period_analyzed": [],
                 "financial_trends": {
                     "revenue": "unclear",
                     "net_profit": "unclear",
-                    "operating_margin": "unclear"
+                    "operating_margin": "unclear",
                 },
                 "management_themes": themes if themes else [],
                 "risks": ["Model output invalid JSON"],
@@ -183,11 +236,42 @@ Return ONLY the forecast JSON now.
                 "qualitative_forecast_next_quarter": "",
                 "confidence": {
                     "level": "low",
-                    "reasons": ["Invalid JSON from model"]
+                    "reasons": ["Invalid JSON from model"],
                 },
                 "sources": {
                     "financial_docs": financial_pdfs,
-                    "transcripts": transcripts
+                    "transcripts": transcripts,
                 },
-                "market_context": market
+                "market_context": market,
             }
+
+        # 6) Ensure all expected keys exist so the frontend / demo never breaks
+        parsed.setdefault("company", "TCS")
+        parsed.setdefault("period_analyzed", [])
+        parsed.setdefault(
+            "financial_trends",
+            {
+                "revenue": "unclear",
+                "net_profit": "unclear",
+                "operating_margin": "unclear",
+            },
+        )
+        parsed.setdefault("management_themes", [])
+        parsed.setdefault("risks", [])
+        parsed.setdefault("opportunities", [])
+        parsed.setdefault("qualitative_forecast_next_quarter", "")
+        parsed.setdefault(
+            "confidence",
+            {
+                "level": "low",
+                "reasons": ["Missing confidence from model"],
+            },
+        )
+
+        parsed["sources"] = {
+            "financial_docs": financial_pdfs,
+            "transcripts": transcripts,
+        }
+        parsed["market_context"] = market
+
+        return parsed
